@@ -1,197 +1,260 @@
 #!/bin/bash
-
 #=============================================================================
-# SSH SOCKS5 Proxy Manager - Final Fixed Version
-# Fixes: Auto-login with password, shows credentials clearly
+# SSH SOCKS5 Proxy Manager - Stable Release
+# GitHub: jamalghaffari/ssh-proxy-script
 #=============================================================================
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
+set -e
+
+# Colors
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
+
+# Config paths
 CONFIG_DIR="$HOME/.ssh_proxy"
 CONFIG_FILE="$CONFIG_DIR/config"
 CRED_FILE="$CONFIG_DIR/credentials.txt"
+PROXY_PORT="1080"
 
 mkdir -p "$CONFIG_DIR"
 
-print_banner() {
+#=============================================================================
+# UTILITY FUNCTIONS
+#=============================================================================
+
+banner() {
     clear
-    echo -e "${BLUE}╔════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║     SSH SOCKS5 Proxy Manager v2.1         ║${NC}"
-    echo -e "${BLUE}╚════════════════════════════════════════════╝${NC}"
+    echo -e "${CYAN}"
+    echo "╔═══════════════════════════════════════════════╗"
+    echo "║         SSH SOCKS5 Proxy Manager             ║"
+    echo "║         github.com/jamalghaffari             ║"
+    echo "╚═══════════════════════════════════════════════╝"
+    echo -e "${NC}"
 }
 
-# تولید یوزرنیم و پسورد رندوم
-generate_random_credentials() {
-    RANDOM_USER="prx$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 6 | head -n 1)"
-    RANDOM_PASS=$(cat /dev/urandom | tr -dc 'A-Za-z0-9!@#$%^&*' | fold -w 16 | head -n 1)
+get_public_ip() {
+    curl -4 -s ifconfig.me || curl -4 -s icanhazip.com || curl -4 -s ipinfo.io/ip || hostname -I | awk '{print $1}'
 }
 
-# نصب sshpass اگر نیست
-install_sshpass() {
+gen_random() {
+    USERNAME="prx$(tr -dc 'a-z0-9' < /dev/urandom | head -c 8)"
+    PASSWORD=$(tr -dc 'A-Za-z0-9!@#$%^&*' < /dev/urandom | head -c 20)
+}
+
+check_root() {
+    if [[ "$EUID" -ne 0 ]]; then
+        echo -e "${RED}[!] Please run as root: sudo $0${NC}"
+        exit 1
+    fi
+}
+
+#=============================================================================
+# CORE FUNCTIONS
+#=============================================================================
+
+install_deps() {
+    echo -e "${YELLOW}[*] Installing dependencies...${NC}"
+    apt-get update -qq 2>/dev/null
+    
     if ! command -v sshpass &> /dev/null; then
-        echo -e "${YELLOW}[*] Installing sshpass...${NC}"
-        sudo apt-get update -qq
-        sudo apt-get install -y -qq sshpass
-        echo -e "${GREEN}[✓] sshpass installed${NC}"
+        apt-get install -y -qq sshpass 2>/dev/null
+        echo -e "${GREEN}  ✓ sshpass installed${NC}"
+    fi
+    
+    if ! command -v curl &> /dev/null; then
+        apt-get install -y -qq curl 2>/dev/null
+        echo -e "${GREEN}  ✓ curl installed${NC}"
     fi
 }
 
-# رفع مشکلات شبکه
 fix_network() {
-    echo -e "${YELLOW}[*] Fixing IPv4 priority...${NC}"
+    echo -e "${YELLOW}[*] Configuring network...${NC}"
     
-    # اولویت IPv4
-    if ! grep -q "precedence ::ffff:0:0/96  100" /etc/gai.conf 2>/dev/null; then
-        echo "precedence ::ffff:0:0/96  100" | sudo tee -a /etc/gai.conf > /dev/null
+    # IPv4 precedence
+    if ! grep -q "^precedence ::ffff:0:0/96  100" /etc/gai.conf 2>/dev/null; then
+        echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
+        echo -e "${GREEN}  ✓ IPv4 priority set${NC}"
     fi
     
-    # SSH فقط IPv4
-    sudo sed -i 's/#AddressFamily any/AddressFamily inet/' /etc/ssh/sshd_config 2>/dev/null
-    sudo sed -i 's/AddressFamily any/AddressFamily inet/' /etc/ssh/sshd_config 2>/dev/null
-    if ! grep -q "AddressFamily inet" /etc/ssh/sshd_config; then
-        echo "AddressFamily inet" | sudo tee -a /etc/ssh/sshd_config > /dev/null
+    # SSH listen on IPv4 only
+    sed -i 's/^#AddressFamily.*/AddressFamily inet/' /etc/ssh/sshd_config 2>/dev/null
+    sed -i 's/^AddressFamily any/AddressFamily inet/' /etc/ssh/sshd_config 2>/dev/null
+    if ! grep -q "^AddressFamily inet" /etc/ssh/sshd_config; then
+        echo "AddressFamily inet" >> /etc/ssh/sshd_config
     fi
     
-    # TCP Forwarding
-    sudo sed -i 's/#AllowTcpForwarding yes/AllowTcpForwarding yes/' /etc/ssh/sshd_config 2>/dev/null
-    sudo sed -i 's/AllowTcpForwarding no/AllowTcpForwarding yes/' /etc/ssh/sshd_config 2>/dev/null
+    # Enable TCP forwarding
+    sed -i 's/^#AllowTcpForwarding.*/AllowTcpForwarding yes/' /etc/ssh/sshd_config 2>/dev/null
+    sed -i 's/^AllowTcpForwarding no/AllowTcpForwarding yes/' /etc/ssh/sshd_config 2>/dev/null
     
-    # فعال‌سازی ICMP (پینگ)
+    # ICMP (ping)
+    iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null || true
+    iptables -A OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT 2>/dev/null || true
     if command -v ufw &> /dev/null; then
-        sudo ufw allow proto icmp from any to any 2>/dev/null
+        ufw allow proto icmp from any to any 2>/dev/null || true
     fi
-    sudo iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null
-    sudo iptables -A OUTPUT -p icmp --icmp-type echo-reply -j ACCEPT 2>/dev/null
     
-    # IP forwarding
-    sudo sysctl -w net.ipv4.ip_forward=1 > /dev/null
+    # Port for proxy
+    if command -v ufw &> /dev/null; then
+        ufw allow $PROXY_PORT/tcp 2>/dev/null || true
+    fi
+    iptables -A INPUT -p tcp --dport $PROXY_PORT -j ACCEPT 2>/dev/null || true
     
-    # ریست سرویس
-    sudo systemctl restart sshd
-    echo -e "${GREEN}[✓] Network optimized${NC}"
+    # Enable forwarding
+    sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
+    
+    systemctl restart sshd
+    echo -e "${GREEN}  ✓ Network configured${NC}"
 }
 
-# ساخت کاربر پروکسی
 create_user() {
-    print_banner
-    generate_random_credentials
-    
     echo -e "${YELLOW}[*] Creating proxy user...${NC}"
+    gen_random
     
-    # حذف کاربر قبلی اگر هست
-    if id "$RANDOM_USER" &>/dev/null; then
-        sudo userdel -r "$RANDOM_USER" 2>/dev/null
+    # Remove existing user if any
+    if id "$USERNAME" &>/dev/null; then
+        userdel -r "$USERNAME" 2>/dev/null
     fi
     
-    # ساخت کاربر
-    sudo useradd -m -s /bin/bash "$RANDOM_USER"
-    echo "$RANDOM_USER:$RANDOM_PASS" | sudo chpasswd
+    # Create user
+    useradd -m -s /bin/bash "$USERNAME"
+    echo "$USERNAME:$PASSWORD" | chpasswd
     
-    # تنظیم SSH
-    sudo mkdir -p "/home/$RANDOM_USER/.ssh"
-    sudo chmod 700 "/home/$RANDOM_USER/.ssh"
-    sudo chown -R "$RANDOM_USER:$RANDOM_USER" "/home/$RANDOM_USER"
+    # Setup SSH directory
+    mkdir -p "/home/$USERNAME/.ssh"
+    chmod 700 "/home/$USERNAME/.ssh"
+    chown -R "$USERNAME:$USERNAME" "/home/$USERNAME"
     
-    # ذخیره اطلاعات
-    echo "USER=$RANDOM_USER" > "$CONFIG_FILE"
-    echo "PASS=$RANDOM_PASS" >> "$CONFIG_FILE"
+    # Save config
+    echo "USERNAME=$USERNAME" > "$CONFIG_FILE"
+    echo "PASSWORD=$PASSWORD" >> "$CONFIG_FILE"
+    echo "PORT=$PROXY_PORT" >> "$CONFIG_FILE"
     
-    # ذخیره در فایل مجزا برای نمایش
-    cat > "$CRED_FILE" << EOF
-=================================
-SSH SOCKS5 Proxy Credentials
-=================================
-Username: $RANDOM_USER
-Password: $RANDOM_PASS
-Server:   \$(curl -4 -s ifconfig.me)
-Port:     1080
-=================================
-EOF
-    
-    echo -e "${GREEN}[✓] User created:${NC}"
-    echo -e "    Username: ${YELLOW}$RANDOM_USER${NC}"
-    echo -e "    Password: ${YELLOW}$RANDOM_PASS${NC}"
+    echo -e "${GREEN}  ✓ User created: $USERNAME${NC}"
 }
 
-# شروع پروکسی با sshpass
-start_proxy() {
-    install_sshpass
+start_tunnel() {
+    echo -e "${YELLOW}[*] Starting SOCKS5 tunnel...${NC}"
     
-    if [[ ! -f "$CONFIG_FILE" ]]; then
-        create_user
-    fi
-    
+    # Load credentials
     source "$CONFIG_FILE"
-    print_banner
     
-    SERVER_IP=$(curl -4 -s ifconfig.me || curl -4 -s icanhazip.com || hostname -I | awk '{print $1}')
+    # Kill existing tunnels on this port
+    pkill -f "ssh.*-D.*$PORT" 2>/dev/null || true
+    sleep 1
     
-    # کشتن پروکسی‌های قبلی
-    pkill -f "ssh.*-D.*1080" 2>/dev/null
-    
-    echo -e "${YELLOW}[*] Starting proxy tunnel...${NC}"
-    
-    # استفاده از sshpass برای ورود خودکار
-    sshpass -p "$PASS" ssh -f -N -D "0.0.0.0:1080" \
+    # Start tunnel with sshpass
+    sshpass -p "$PASSWORD" ssh -f -N \
+        -D "0.0.0.0:$PORT" \
         -o "AddressFamily inet" \
-        -o "ServerAliveInterval 30" \
-        -o "ServerAliveCountMax 3" \
         -o "StrictHostKeyChecking=no" \
         -o "UserKnownHostsFile=/dev/null" \
-        "$USER@127.0.0.1" 2>/dev/null
+        -o "ServerAliveInterval=30" \
+        -o "ServerAliveCountMax=3" \
+        -o "TCPKeepAlive=yes" \
+        "$USERNAME@127.0.0.1" 2>/dev/null
     
-    if pgrep -f "ssh.*-D.*1080" > /dev/null; then
+    sleep 2
+    
+    # Verify tunnel
+    if pgrep -f "ssh.*-D.*$PORT" > /dev/null; then
+        SERVER_IP=$(get_public_ip)
+        
+        # Save credentials file
+        cat > "$CRED_FILE" << EOF
+========================================
+ SSH SOCKS5 Proxy Credentials
+========================================
+ Type:     SOCKS5
+ Host:     $SERVER_IP
+ Port:     $PORT
+ Username: $USERNAME
+ Password: $PASSWORD
+========================================
+ Test:     curl --socks5 $USERNAME:$PASSWORD@$SERVER_IP:$PORT ifconfig.me
+========================================
+EOF
+        
+        # Display success
         echo ""
-        echo -e "${GREEN}══════════════════════════════════════════════════════${NC}"
-        echo -e "${GREEN}              PROXY IS RUNNING!                       ${NC}"
-        echo -e "${GREEN}══════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}╔══════════════════════════════════════════════════════╗${NC}"
+        echo -e "${GREEN}║              PROXY IS RUNNING ✓                      ║${NC}"
+        echo -e "${GREEN}╚══════════════════════════════════════════════════════╝${NC}"
         echo ""
-        echo -e "  ${YELLOW}Type:${NC}     SOCKS5"
+        echo -e "  ${YELLOW}Type:${NC}     ${GREEN}SOCKS5${NC}"
         echo -e "  ${YELLOW}Host:${NC}     ${GREEN}$SERVER_IP${NC}"
-        echo -e "  ${YELLOW}Port:${NC}     ${GREEN}1080${NC}"
-        echo -e "  ${YELLOW}Username:${NC} ${GREEN}$USER${NC}"
-        echo -e "  ${YELLOW}Password:${NC} ${GREEN}$PASS${NC}"
+        echo -e "  ${YELLOW}Port:${NC}     ${GREEN}$PORT${NC}"
+        echo -e "  ${YELLOW}Username:${NC} ${GREEN}$USERNAME${NC}"
+        echo -e "  ${YELLOW}Password:${NC} ${GREEN}$PASSWORD${NC}"
         echo ""
-        echo -e "  ${BLUE}Test:${NC} curl --socks5 $USER:$PASS@$SERVER_IP:1080 ifconfig.me"
+        echo -e "  ${CYAN}Test command:${NC}"
+        echo -e "  curl --socks5 $USERNAME:$PASSWORD@$SERVER_IP:$PORT ifconfig.me"
         echo ""
-        echo -e "  ${YELLOW}Credentials saved: $CRED_FILE${NC}"
-        echo -e "${GREEN}══════════════════════════════════════════════════════${NC}"
+        echo -e "  ${CYAN}Credentials saved:${NC} $CRED_FILE"
+        echo ""
+        
+        return 0
     else
-        echo -e "${RED}[!] Failed to start proxy. Check credentials.${NC}"
-        echo -e "${RED}    Try running: ssh $USER@127.0.0.1${NC}"
+        echo -e "${RED}[!] Failed to start tunnel${NC}"
+        echo -e "${RED}    Debug: sshpass -p 'PASSWORD' ssh -v $USERNAME@127.0.0.1${NC}"
+        return 1
     fi
 }
 
-# نمایش اطلاعات
-show_info() {
-    if [[ -f "$CONFIG_FILE" ]]; then
-        source "$CONFIG_FILE"
-        SERVER_IP=$(curl -4 -s ifconfig.me 2>/dev/null)
-        echo -e "${GREEN}Proxy Credentials:${NC}"
-        echo -e "  User: $USER"
-        echo -e "  Pass: $PASS"
-        echo -e "  Host: $SERVER_IP:1080"
+show_status() {
+    if pgrep -f "ssh.*-D.*$PROXY_PORT" > /dev/null; then
+        echo -e "${GREEN}[✓] Proxy is running on port $PROXY_PORT${NC}"
+        if [[ -f "$CRED_FILE" ]]; then
+            cat "$CRED_FILE"
+        fi
     else
-        echo -e "${RED}No proxy configured yet.${NC}"
+        echo -e "${RED}[✗] Proxy is not running${NC}"
     fi
 }
 
-# منوی اصلی
-case "${1:-start}" in
-    "fix")
+stop_proxy() {
+    echo -e "${YELLOW}[*] Stopping proxy...${NC}"
+    pkill -f "ssh.*-D.*$PROXY_PORT" 2>/dev/null || true
+    echo -e "${GREEN}[✓] Proxy stopped${NC}"
+}
+
+#=============================================================================
+# MAIN
+#=============================================================================
+
+check_root
+
+case "${1}" in
+    install|setup|start)
+        banner
+        install_deps
         fix_network
-        ;;
-    "user")
         create_user
+        start_tunnel
         ;;
-    "info")
-        show_info
+    stop)
+        stop_proxy
         ;;
-    "stop")
-        pkill -f "ssh.*-D.*1080"
-        echo -e "${GREEN}[✓] Proxy stopped${NC}"
+    status|info)
+        show_status
+        ;;
+    restart)
+        stop_proxy
+        sleep 2
+        banner
+        start_tunnel
+        ;;
+    user|newuser)
+        create_user
+        echo -e "${YELLOW}Run '$0 start' to start proxy with new user${NC}"
         ;;
     *)
-        fix_network
-        start_proxy
+        echo "Usage: $0 {install|stop|status|restart|user}"
+        echo ""
+        echo "  install   - Full setup (deps + network + user + start)"
+        echo "  stop      - Stop proxy tunnel"
+        echo "  status    - Show proxy status and credentials"
+        echo "  restart   - Restart proxy tunnel"
+        echo "  user      - Create new random user only"
+        exit 1
         ;;
 esac
